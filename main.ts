@@ -1,47 +1,53 @@
-// Pump.fun Replay Sprint — early-momentum paper trading bot.
+// Pump.fun Replay Sprint — early-momentum paper trading bot (v2).
 // Protocol: agent-fun/replay/v2, newline-delimited JSON on stdin/stdout.
 //   hello -> (no reply); batch {seq, slot, events, marks, fills, account} -> one reply
 //   {type:"reply", seq, orders}; done -> exit.
-// Strategy: buy young coins showing early momentum plus buy dominance, ladder up to
-// 1.2 SOL per coin under the 1%-of-real-reserves per-order cap, at most 5 open
-// positions. Exits: take half at +60%, the rest at +120% or on a 25% trailing drop,
-// stop-loss at -25% from average entry, time exit after 90 minutes below +15%.
-// Every decision is a pure function of the replayed events: no clock, no randomness,
-// so two runs produce byte-identical action logs.
+// Strategy (tuned on the dev replay with an offline simulator, then verified
+// with the kit's grade-local): buy young coins showing early momentum plus buy
+// dominance, ladder up to 1.0 SOL per coin under the 1%-of-real-reserves
+// per-order cap, at most 5 open positions, at most 40 coins entered in total.
+// Exits: take half at +50%, the rest at +100% or on a 20% trailing drop,
+// stop-loss at -11% from average entry, time exit after 90 minutes below +15%.
+// A coin is never re-entered after an exit. Sells are emitted in full and the
+// engine rejects them for free while the payout exceeds real reserves, so a
+// position waits for a clean exit instead of bleeding out in dust sells.
+// Total position value is kept under half of a coin's real reserves so an
+// exit stays payable. Every decision is a pure function of the replayed
+// events: no clock, no randomness, so two runs produce byte-identical logs.
 
 import * as readline from "node:readline";
 
 // ---------------------------------------------------------------- config
 const MAX_OPEN_POSITIONS = 5;
-const TARGET_POSITION = 1_200_000_000n; // 1.2 SOL per coin, in lamports
+const MAX_COINS_ENTERED = 40; // guardrail needs >= 20 round-tripped coins
+const TARGET_POSITION = 1_000_000_000n; // 1.0 SOL per coin, in lamports
 const MIN_BUY = 20_000_000n; // 0.02 SOL per buy order
-const MIN_ENTRY_AGE_S = 120; // do not chase the first two minutes
+const MAX_BUYS_PER_POSITION = 8; // ladder steps per coin
+const MIN_ENTRY_AGE_S = 30; // do not chase the first thirty seconds
 const MAX_ENTRY_AGE_S = 1200; // stop entering after twenty minutes
-const ENTRY_GAIN_NUM = 120; // entry needs price >= 1.20x the creation price
-const MOMENTUM_NUM = 110; // and >= 1.10x its price five minutes ago
+const ENTRY_GAIN_NUM = 105; // entry needs price >= 1.05x the creation price
+const ENTRY_GAIN_MAX_NUM = 200; // and <= 2.00x (never chase a vertical spike)
+const MOMENTUM_NUM = 102; // and >= 1.02x its price five minutes ago
 const MOMENTUM_LOOKBACK_S = 300;
 const MAX_ENTRY_MCAP_SOL = 100; // skip coins already worth 100 SOL or more
 // Price is lamports per base token unit (6 decimals): one billion tokens is
 // 1e15 base units, so market cap in SOL is price * 1e15 / 1e9 = price * 1e6.
 const MCAP_MULTIPLIER = 1_000_000;
-const MIN_TRADES = 8;
-const MIN_BUYERS = 5;
+const MIN_TRADES = 4;
+const MIN_BUYERS = 3;
 const BUY_DOMINANCE_NUM = 6; // buy volume must be >= 1.2x sell volume (6/5)
 const BUY_DOMINANCE_DEN = 5;
-const TAKE_PROFIT_1_NUM = 160; // +60%: sell half
-const TAKE_PROFIT_2_NUM = 220; // +120%: sell the rest
-const TRAIL_NUM = 75; // after TP1, exit if price falls to 75% of the peak
-const STOP_LOSS_NUM = 75; // -25% from average entry: exit everything
+const TAKE_PROFIT_1_NUM = 150; // +50%: sell half
+const TAKE_PROFIT_2_NUM = 200; // +100%: sell the rest
+const TRAIL_NUM = 80; // after TP1, exit if price falls to 80% of the peak
+const STOP_LOSS_NUM = 89; // -11% from average entry: exit everything
 const TIME_EXIT_AGE_S = 5400; // ninety minutes
 const TIME_EXIT_GAIN_NUM = 115; // still below +15% by then: exit
-const REENTRY_COOLDOWN_S = 1800; // do not re-enter a coin for thirty minutes
 const MAX_SLIPPAGE_BPS = 500;
 const MAX_ORDERS_PER_BATCH = 16;
 const CASH_BUFFER = 1_000_000n; // lamports kept back for transaction fees
 const MAX_SAMPLES_PER_MINT = 120;
 const MAX_BUYERS_TRACKED = 200;
-const SELL_PAYOUT_FRACTION_NUM = 9; // a sell may pay out at most 90% of real reserves
-const SELL_PAYOUT_FRACTION_DEN = 10;
 
 // ---------------------------------------------------------------- types
 type Order =
@@ -86,6 +92,7 @@ interface Position {
   peak: number;
   openedTs: number;
   soldHalf: boolean;
+  buys: number;
 }
 
 // ---------------------------------------------------------------- state
@@ -93,7 +100,8 @@ const mints = new Map<string, MintState>();
 const positions = new Map<string, Position>();
 const pendingBuys = new Map<string, bigint>(); // mint -> lamports committed, not yet filled
 const pendingNewMints = new Set<string>(); // mints with a buy in flight, no position yet
-const lastExitTs = new Map<string, number>();
+const enteredMints = new Set<string>(); // every mint we ever emitted a buy for
+const neverReenter = new Set<string>(); // mints whose position closed once
 let cashLamports = 0n;
 let txFeeLamports = 105_000n; // base 5000 + priority 100000, replaced by hello.fees
 let orderCounter = 0;
@@ -250,12 +258,14 @@ function onFills(fills: any[]): void {
           peak: m ? m.lastPrice : 0,
           openedTs: m ? m.lastTs : 0,
           soldHalf: false,
+          buys: 0,
         };
         positions.set(mint, p);
       }
       p.tokens += tokens;
       p.quoteIn += quote;
       p.tokensBought += tokens;
+      p.buys += 1;
       const m = mints.get(mint);
       if (m && m.lastPrice > p.peak) p.peak = m.lastPrice;
       const pend = pendingBuys.get(mint) || 0n;
@@ -270,8 +280,7 @@ function onFills(fills: any[]): void {
         p.tokens -= tokens;
         if (p.tokens <= 0n) {
           positions.delete(mint);
-          const m = mints.get(mint);
-          lastExitTs.set(mint, m ? m.lastTs : 0);
+          neverReenter.add(mint);
         }
       }
     }
@@ -279,6 +288,23 @@ function onFills(fills: any[]): void {
 }
 
 // ---------------------------------------------------------------- decisions
+// All entry filters in one place: age window, trade/buyer counts, gain band,
+// market-cap ceiling, buy dominance, and five-minute momentum.
+function entryEligible(m: MintState): boolean {
+  const age = m.lastTs - m.createdTs;
+  if (age < MIN_ENTRY_AGE_S || age > MAX_ENTRY_AGE_S) return false;
+  if (m.trades < MIN_TRADES) return false;
+  if (m.buyers.size < MIN_BUYERS) return false;
+  if (m.lastPrice <= 0 || m.createPrice <= 0) return false;
+  if (m.lastPrice < m.createPrice * (ENTRY_GAIN_NUM / 100)) return false;
+  if (m.lastPrice > m.createPrice * (ENTRY_GAIN_MAX_NUM / 100)) return false;
+  if (marketCapSol(m.lastPrice) >= MAX_ENTRY_MCAP_SOL) return false;
+  if (m.buyVol * BigInt(BUY_DOMINANCE_DEN) < m.sellVol * BigInt(BUY_DOMINANCE_NUM)) return false;
+  const fiveMinAgo = priceAt(m, m.lastTs - MOMENTUM_LOOKBACK_S);
+  if (m.lastPrice < fiveMinAgo * (MOMENTUM_NUM / 100)) return false;
+  return true;
+}
+
 function committedLamports(mint: string): bigint {
   const p = positions.get(mint);
   const spent = p ? p.quoteIn : 0n;
@@ -286,24 +312,8 @@ function committedLamports(mint: string): bigint {
   return spent + pend;
 }
 
-function maxSellTokens(m: MintState, tokens: bigint): bigint {
-  if (tokens <= 0n) return 0n;
-  if (m.lastRealSol <= 0n || m.lastPrice <= 0) return tokens;
-  // payout = tokens * price ; cap payout at 90% of real SOL reserves.
-  // tokensMax = realSol * 0.9 / price ; price = vSol / vTok (lamports per token).
-  const cap = (m.lastRealSol * BigInt(SELL_PAYOUT_FRACTION_NUM)) / BigInt(SELL_PAYOUT_FRACTION_DEN);
-  const vSol = m.lastPrice; // float price; convert via reserves instead for exactness
-  void vSol;
-  // Exact BigInt form: tokensMax = cap * vTok / vSol using last reserves ratio.
-  // We keep last virtual reserves implicitly via lastPrice; recompute from price:
-  // tokensMax = cap / price  (price in lamports per token, float) -> floor.
-  const maxByPayout = BigInt(Math.floor(Number(cap) / m.lastPrice));
-  return tokens < maxByPayout ? tokens : maxByPayout;
-}
-
 function decide(batch: any): Order[] {
   const orders: Order[] = [];
-  const nowTs = batch.events.length > 0 ? Number(batch.events[batch.events.length - 1].timestamp) : 0;
   const touched = new Set<string>();
   for (const ev of batch.events) touched.add(String(ev.mint));
 
@@ -322,26 +332,27 @@ function decide(batch: any): Order[] {
     if (price <= entry * (STOP_LOSS_NUM / 100)) {
       sellTokens = p.tokens; // stop-loss: exit everything
     } else if (!p.soldHalf && price >= entry * (TAKE_PROFIT_1_NUM / 100)) {
-      sellTokens = p.tokens / 2n; // take half at +60%
+      sellTokens = p.tokens / 2n; // take half at +50%
       p.soldHalf = true;
     } else if (p.soldHalf && price >= entry * (TAKE_PROFIT_2_NUM / 100)) {
-      sellTokens = p.tokens; // take the rest at +120%
+      sellTokens = p.tokens; // take the rest at +100%
     } else if (p.soldHalf && price <= p.peak * (TRAIL_NUM / 100)) {
       sellTokens = p.tokens; // trailing stop after the first take-profit
     } else if (age >= TIME_EXIT_AGE_S && price < entry * (TIME_EXIT_GAIN_NUM / 100)) {
       sellTokens = p.tokens; // dead money after ninety minutes
     }
     if (sellTokens > 0n) {
-      const capped = maxSellTokens(m, sellTokens);
-      if (capped > 0n) {
-        orders.push({
-          side: "sell",
-          client_id: nextClientId("s"),
-          mint,
-          token_amount: capped.toString(),
-          max_slippage_bps: MAX_SLIPPAGE_BPS,
-        });
-      }
+      // Emit the full exit. The engine rejects a sell whose payout exceeds
+      // real reserves for free, and it fills cleanly once reserves grow, so
+      // never shrink an exit into dust: partial exits bleed a position out
+      // at the bottom and pay a transaction fee per chunk.
+      orders.push({
+        side: "sell",
+        client_id: nextClientId("s"),
+        mint,
+        token_amount: sellTokens.toString(),
+        max_slippage_bps: MAX_SLIPPAGE_BPS,
+      });
     }
   }
 
@@ -353,31 +364,31 @@ function decide(batch: any): Order[] {
       if (orders.length >= MAX_ORDERS_PER_BATCH) break;
       const m = mints.get(mint);
       if (!m || m.complete) continue;
-      const age = m.lastTs - m.createdTs;
-      if (age < MIN_ENTRY_AGE_S || age > MAX_ENTRY_AGE_S) continue;
-      if (m.trades < MIN_TRADES) continue;
-      if (m.buyers.size < MIN_BUYERS) continue;
-      if (m.lastPrice <= 0 || m.createPrice <= 0) continue;
-      if (m.lastPrice < m.createPrice * (ENTRY_GAIN_NUM / 100)) continue;
-      if (marketCapSol(m.lastPrice) >= MAX_ENTRY_MCAP_SOL) continue;
-      if (m.buyVol * BigInt(BUY_DOMINANCE_DEN) < m.sellVol * BigInt(BUY_DOMINANCE_NUM)) continue;
-      const fiveMinAgo = priceAt(m, m.lastTs - MOMENTUM_LOOKBACK_S);
-      if (m.lastPrice < fiveMinAgo * (MOMENTUM_NUM / 100)) continue;
-      const lastExit = lastExitTs.get(mint);
-      if (lastExit !== undefined && m.lastTs - lastExit < REENTRY_COOLDOWN_S) continue;
+      if (neverReenter.has(mint)) continue;
+      if (enteredMints.size >= MAX_COINS_ENTERED && !enteredMints.has(mint)) continue;
+      if (!entryEligible(m)) continue;
 
       const p = positions.get(mint);
+      if (p && p.buys >= MAX_BUYS_PER_POSITION) continue;
       const committed = committedLamports(mint);
-      if (committed >= TARGET_POSITION) continue;
       if (p) {
         // Ladder only into strength, never average down hard.
         const entry = entryPriceOf(p);
         if (entry > 0 && m.lastPrice < entry * 0.95) continue;
       }
       if (m.lastRealSol <= 0n) continue;
+      // Total spent per coin is capped at half of real reserves, and so is
+      // the position's current value, so a full exit stays payable.
+      const spentCap = m.lastRealSol / 2n;
+      let quote = TARGET_POSITION < spentCap ? TARGET_POSITION : spentCap;
+      quote -= committed;
+      if (p) {
+        const posValue = BigInt(Math.floor(Number(p.tokens) * m.lastPrice));
+        const room = m.lastRealSol / 2n - posValue;
+        if (quote > room) quote = room;
+      }
       // One order per mint per reply, at most 1% of decision-time real reserves.
       const cap1pct = m.lastRealSol / 100n;
-      let quote = TARGET_POSITION - committed;
       if (quote > cap1pct) quote = cap1pct;
       const feesForReply = txFeeLamports * BigInt(orders.length + 1);
       const affordable = cashLamports - CASH_BUFFER - feesForReply;
@@ -391,11 +402,11 @@ function decide(batch: any): Order[] {
         max_slippage_bps: MAX_SLIPPAGE_BPS,
       });
       pendingBuys.set(mint, (pendingBuys.get(mint) || 0n) + quote);
+      enteredMints.add(mint);
       if (!p) pendingNewMints.add(mint);
     }
   }
 
-  void nowTs;
   return orders;
 }
 
@@ -424,7 +435,10 @@ function handleBatch(msg: any): void {
     const live = new Set<string>();
     for (const pos of msg.account.positions) live.add(String(pos.mint));
     for (const mint of [...positions.keys()]) {
-      if (!live.has(mint) && !pendingBuys.has(mint)) positions.delete(mint);
+      if (!live.has(mint) && !pendingBuys.has(mint)) {
+        positions.delete(mint);
+        neverReenter.add(mint);
+      }
     }
   }
   const orders = decide(msg);
