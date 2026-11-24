@@ -312,6 +312,29 @@ function committedLamports(mint: string): bigint {
   return spent + pend;
 }
 
+// Exit decisions for one open position, in order: stop-loss, take-profit
+// 1/2, trailing stop, time exit. Pure function of the position and mint
+// state (peak must already be updated by the caller); sets soldHalf when
+// the first take-profit fires.
+function computeExitTokens(p: Position, m: MintState): bigint {
+  const price = m.lastPrice;
+  const entry = entryPriceOf(p);
+  const age = m.lastTs - m.createdTs;
+  if (price <= entry * (STOP_LOSS_NUM / 100)) {
+    return p.tokens; // stop-loss: exit everything
+  } else if (!p.soldHalf && price >= entry * (TAKE_PROFIT_1_NUM / 100)) {
+    p.soldHalf = true;
+    return p.tokens / 2n; // take half at +50%
+  } else if (p.soldHalf && price >= entry * (TAKE_PROFIT_2_NUM / 100)) {
+    return p.tokens; // take the rest at +100%
+  } else if (p.soldHalf && price <= p.peak * (TRAIL_NUM / 100)) {
+    return p.tokens; // trailing stop after the first take-profit
+  } else if (age >= TIME_EXIT_AGE_S && price < entry * (TIME_EXIT_GAIN_NUM / 100)) {
+    return p.tokens; // dead money after ninety minutes
+  }
+  return 0n;
+}
+
 function decide(batch: any): Order[] {
   const orders: Order[] = [];
   const touched = new Set<string>();
@@ -327,20 +350,7 @@ function decide(batch: any): Order[] {
     const entry = entryPriceOf(p);
     if (entry <= 0) continue;
     if (price > p.peak) p.peak = price;
-    const age = m.lastTs - m.createdTs;
-    let sellTokens = 0n;
-    if (price <= entry * (STOP_LOSS_NUM / 100)) {
-      sellTokens = p.tokens; // stop-loss: exit everything
-    } else if (!p.soldHalf && price >= entry * (TAKE_PROFIT_1_NUM / 100)) {
-      sellTokens = p.tokens / 2n; // take half at +50%
-      p.soldHalf = true;
-    } else if (p.soldHalf && price >= entry * (TAKE_PROFIT_2_NUM / 100)) {
-      sellTokens = p.tokens; // take the rest at +100%
-    } else if (p.soldHalf && price <= p.peak * (TRAIL_NUM / 100)) {
-      sellTokens = p.tokens; // trailing stop after the first take-profit
-    } else if (age >= TIME_EXIT_AGE_S && price < entry * (TIME_EXIT_GAIN_NUM / 100)) {
-      sellTokens = p.tokens; // dead money after ninety minutes
-    }
+    const sellTokens = computeExitTokens(p, m);
     if (sellTokens > 0n) {
       // Emit the full exit. The engine rejects a sell whose payout exceeds
       // real reserves for free, and it fills cleanly once reserves grow, so
