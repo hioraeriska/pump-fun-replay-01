@@ -21,7 +21,9 @@ const ENTRY_GAIN_NUM = 120; // entry needs price >= 1.20x the creation price
 const MOMENTUM_NUM = 110; // and >= 1.10x its price five minutes ago
 const MOMENTUM_LOOKBACK_S = 300;
 const MAX_ENTRY_MCAP_SOL = 100; // skip coins already worth 100 SOL or more
-const TOKEN_SUPPLY = 1_000_000_000; // pump.fun mints one billion tokens
+// Price is lamports per base token unit (6 decimals): one billion tokens is
+// 1e15 base units, so market cap in SOL is price * 1e15 / 1e9 = price * 1e6.
+const MCAP_MULTIPLIER = 1_000_000;
 const MIN_TRADES = 8;
 const MIN_BUYERS = 5;
 const BUY_DOMINANCE_NUM = 6; // buy volume must be >= 1.2x sell volume (6/5)
@@ -109,7 +111,7 @@ function priceOf(vSol: bigint, vTok: bigint): number {
 }
 
 function marketCapSol(price: number): number {
-  return price * TOKEN_SUPPLY;
+  return price * MCAP_MULTIPLIER;
 }
 
 function priceAt(m: MintState, ts: number): number {
